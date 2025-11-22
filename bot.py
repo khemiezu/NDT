@@ -1,4 +1,3 @@
-# bot.py
 import os
 import asyncio
 import tempfile
@@ -9,43 +8,35 @@ from pathlib import Path
 from discord import Intents, File
 from discord.ext import commands
 
-# ------------- CONFIG -------------
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")  # set in Railway env
-BACKGROUND = os.environ.get("BACKGROUND_PATH", "background.jpg")  # included in repo
-FFMPEG = os.environ.get("FFMPEG_PATH", "ffmpeg")  # usually '/usr/bin/ffmpeg' on Linux
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))  # limit concurrency
-# ----------------------------------
+# ------------ CONFIG ------------
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+BACKGROUND = os.environ.get("BACKGROUND_PATH", "background.jpg")
+FFMPEG = os.environ.get("FFMPEG_PATH", "ffmpeg")
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
+# --------------------------------
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("overlay-bot")
+logger = logging.getLogger("overlaybot")
 
 intents = Intents.default()
-intents.message_content = True  # required to read messages in some setups
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
-async def download_attachment(url: str, dest_path: Path):
-    """Download file via aiohttp (works with large files)."""
+async def download_attachment(url: str, dest: Path):
     timeout = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Download failed: {resp.status}")
-            with open(dest_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 64):
+            with open(dest, "wb") as f:
+                async for chunk in resp.content.iter_chunked(65536):
                     f.write(chunk)
 
 
-def build_ffmpeg_cmd(background: str, input_video: str, output_file: str):
-    """
-    Build ffmpeg command:
-    - Scale background to 1080x1920 preserving aspect and pad black
-    - Scale overlay to width 800 (height auto)
-    - Overlay centered
-    - 60 FPS, H.264, AAC
-    """
+def build_ffmpeg(background: str, input_video: str, output: str):
     filter_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black[bg];"
@@ -53,10 +44,10 @@ def build_ffmpeg_cmd(background: str, input_video: str, output_file: str):
         "[bg][ov]overlay=(W-w)/2:(H-h)/2:shortest=1,format=yuv420p"
     )
 
-    cmd = [
+    return [
         FFMPEG, "-y",
-        "-loop", "1", "-i", background,  # input 0: background image
-        "-i", input_video,               # input 1: overlay video
+        "-loop", "1", "-i", background,
+        "-i", input_video,
         "-filter_complex", filter_complex,
         "-map", "0:v",
         "-map", "1:a?",
@@ -67,27 +58,77 @@ def build_ffmpeg_cmd(background: str, input_video: str, output_file: str):
         "-c:a", "aac",
         "-b:a", "128k",
         "-shortest",
-        output_file
+        output
     ]
-    return cmd
 
 
 @bot.event
 async def on_ready():
-    logger.info("Bot ready: %s", bot.user)
+    logger.info(f"Bot is ready: {bot.user}")
 
 
 @bot.event
 async def on_message(message):
-    # ignore messages from the bot itself
     if message.author == bot.user:
         return
 
-    # if the message has attachments, look for video-like attachments
     if message.attachments:
-        # process the first attachment that looks like a video
         for att in message.attachments:
-            # basic mime-type check; discord sends content_type sometimes
-            if (att.content_type and att.content_type.startswith("video")) or att.filename.lower().endswith((".mp4", ".mov", ".mkv", ".webm", ".avi", ".hevc", ".m4v")):
-                # spawn a background task so reading on_message remains fast
-                asyncio.create_task(handle_video_mes_
+            filename = att.filename.lower()
+            if (
+                (att.content_type and att.content_type.startswith("video"))
+                or filename.endswith((".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"))
+            ):
+                asyncio.create_task(handle_video_message(message, att))
+                break
+
+    await bot.process_commands(message)
+
+
+async def handle_video_message(message, attachment):
+    async with semaphore:
+        tmp = Path(tempfile.mkdtemp(prefix="overlay-"))
+        try:
+            input_path = tmp / ("input" + Path(attachment.filename).suffix)
+            output_path = tmp / "output.mp4"
+
+            await message.channel.send(f"Downloading `{attachment.filename}` ...")
+            await download_attachment(attachment.url, input_path)
+
+            await message.channel.send("Processing video, please wait...")
+
+            cmd = build_ffmpeg(BACKGROUND, str(input_path), str(output_path))
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await proc.communicate()
+
+            if proc.returncode != 0 or not output_path.exists():
+                logger.error(err.decode(errors="ignore"))
+                await message.channel.send("FFmpeg failed to process the video.")
+                return
+
+            try:
+                await message.channel.send("Uploading result...")
+                await message.channel.send(file=File(str(output_path)))
+            except Exception as e:
+                await message.channel.send(f"Upload failed: {e}")
+
+        except Exception as e:
+            logger.exception(e)
+            await message.channel.send(f"Error: {e}")
+        finally:
+            try:
+                shutil.rmtree(tmp)
+            except:
+                pass
+
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("ERROR: DISCORD_TOKEN not set")
+        exit(1)
+    bot.run(DISCORD_TOKEN)
