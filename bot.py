@@ -26,21 +26,31 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
 
 async def download_attachment(url: str, dest: Path):
+    """Download file with aiohttp."""
     timeout = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Download failed: {resp.status}")
+
             with open(dest, "wb") as f:
                 async for chunk in resp.content.iter_chunked(65536):
                     f.write(chunk)
 
 
 def build_ffmpeg(background: str, input_video: str, output: str):
+    """
+    Fully safe FFmpeg filters:
+    - Convert JPEG to proper YUV format
+    - Scale background to 1080x1920
+    - Scale video overlay to width=800
+    - Center overlay
+    - Output 60fps H.264
+    """
     filter_complex = (
-        "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "[0:v]format=yuvj420p,scale=1080:1920:force_original_aspect_ratio=decrease,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black[bg];"
-        "[1:v]scale=800:-2[ov];"
+        "[1:v]format=yuv420p,scale=800:-2[ov];"
         "[bg][ov]overlay=(W-w)/2:(H-h)/2:shortest=1,format=yuv420p"
     )
 
@@ -72,12 +82,13 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # Detect video attachments
     if message.attachments:
         for att in message.attachments:
-            filename = att.filename.lower()
+            fn = att.filename.lower()
             if (
                 (att.content_type and att.content_type.startswith("video"))
-                or filename.endswith((".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"))
+                or fn.endswith((".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"))
             ):
                 asyncio.create_task(handle_video_message(message, att))
                 break
@@ -95,7 +106,7 @@ async def handle_video_message(message, attachment):
             await message.channel.send(f"Downloading `{attachment.filename}` ...")
             await download_attachment(attachment.url, input_path)
 
-            await message.channel.send("Processing video, please wait...")
+            await message.channel.send("Processing video with FFmpeg, please wait...")
 
             cmd = build_ffmpeg(BACKGROUND, str(input_path), str(output_path))
 
@@ -111,11 +122,8 @@ async def handle_video_message(message, attachment):
                 await message.channel.send("FFmpeg failed to process the video.")
                 return
 
-            try:
-                await message.channel.send("Uploading result...")
-                await message.channel.send(file=File(str(output_path)))
-            except Exception as e:
-                await message.channel.send(f"Upload failed: {e}")
+            await message.channel.send("Uploading processed video...")
+            await message.channel.send(file=File(str(output_path)))
 
         except Exception as e:
             logger.exception(e)
